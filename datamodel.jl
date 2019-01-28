@@ -1,4 +1,4 @@
-using DataFrames, CSV, Ipopt, JuMP
+using DataFrames, CSV, JuMP, Gurobi, Cbc, Ipopt
 
 function create_data_model()
   #Creates the data for the example.
@@ -27,14 +27,18 @@ function create_data_model()
 
   #all arcs/roads
   arcs = []
+  global N_arcs = 0
   for i in nodes
     if i == length(nodes)
-      push!(arcs, (i,1))
+      break #push!(arcs, (i,1))
+      #N_arcs += 1
     else
       push!(arcs, (i,i+1))
+      N_arcs += 1
     end
   end
   data[:arcs] = arcs
+  data[:N_arcs] = N_arcs
 
   return data
 
@@ -42,16 +46,18 @@ end
 
 data = create_data_model()
 
-VRP = Model(solver=IpoptSolver())
+#I changed from Ipopt because Ipopt has no support for integer or binary variables
+VRP = Model(solver=GurobiSolver())
 
 #########################################################
 #   Mechanical Power consumption of vehicle_capacity    #
 #########################################################
-velocity = 70*rand()   #Choose a random speed between 0 and 70
+#avg_distance = sum(data[:distances][1])/length(data[:distances][1])
+velocity = rand(30:55)   #Choose a random speed between 0 and 70
 mass_vehicle = 500     #Mass of vehicle
-mass_person = 80*rand() #Choose the weight of one person
+mass_person = rand(45:100) #Choose the weight of one person
 gravity = 9.8          #acceleration due to gravity
-duration = 3*rand()    #time to travel between arc i and i+1
+duration = rand(0.5:2.5)    #time to travel between arc i and i+1
 acc = velocity/duration     #acceleration of vehicle
 alpha = 0.08727        #gradient angle of the road/arc
 coeff1 = 0.05          #Rolling friction coefficient for cars on moving on snow
@@ -80,38 +86,46 @@ PW = (Fa+Fg+Fr+FV)*velocity
 #          Variables             #
 ##################################
 #Major decision variable which is 1 if vehivle i goes between arcs i & i+1
-#nodes = range(1, data[ :num_locations])
-@variable(VRP, x[i in nodes], lowerbound = 0, upperbound = 1, start = 1)
-@variable(VRP, dur[i in nodes], lowerbound = 1)         #arrival time at node i
-@variable(VRP, P_arc[i in nodes]) #power consumption after traversing from node i to i+1
-@variable(VRP, F_arc[i in nodes]) #fuel rate over an arc
-@variable(VRP, F_con[i in nodes]) #fuel consumption over arc i to i+1
-@variable(VRP, acc[i in nodes])   #acceleration of vehicle from node i to i+1
-@variable(VRP, ppload[i in nodes], lowerbound = 1) #number of people in each node
+@variable(VRP, x[i in 1:N_arcs], start = 1, Bin)
+@variable(VRP, dur[i in 1:N_arcs], lowerbound = 1)         #arrival time at node i
+@variable(VRP, P_arc[i in 1:N_arcs]) #power consumption after traversing from node i to i+1
+@variable(VRP, F_arc[i in 1:N_arcs]) #fuel rate over an arc
+@variable(VRP, F_con[i in 1:N_arcs]) #fuel consumption over arc i to i+1
+@variable(VRP, acc[i in 1:N_arcs])   #acceleration of vehicle from node i to i+1
+@variable(VRP, ppload[i in nodes], lowerbound = 0, Int) #number of people carried in each node
+@variable(VRP, wait_dur[i in nodes])
 @variable(VRP, TotalCost, lowerbound=FV)
 
 ##################################
-#           Constraints          #
+#           Constraints
 ##################################
 #Power consumption on each arc
-@constraint(VRP, PC[i in nodes],
+@constraint(VRP, PowerConsumption[i in 1:N_arcs],
         (P_arc[i] == velocity * (Fa + coeff2*cos(alpha) + mass_vehicle*gravity*sin(alpha) + mass_person*gravity*ppload[i])))
-@constraint(VRP, FR[i in nodes],
+@constraint(VRP, FuelRate[i in 1:N_arcs],
         (F_arc[i] == (ξ/(k*ψ))*(k*N*D) + P_arc[i]/(η*ηtf))) #fuel rate for each arc
-@constraint(VRP, FC[i in nodes],
+#The following is an equality quadratic constraint which isn't supported by Gurobi
+#But when I tried converting to inequality, I got another error about
+#"Q" matrix not being positive definite
+@constraint(VRP, FuelConsumption[i in 1:N_arcs],
         (F_con[i] == dur[i] * F_arc[i]))    #fuel consumption on each arc
-@constraint(VRP, NoV,
-        (sum(x[i] for i in nodes) ≤ data[:num_vehicles]))  #vehicle on each route is less than or equal to number of vehicles in fleet
+@constraint(VRP, duration_arc[i in 1:N_arcs],
+        (dur[i] ≤ data[:distances][1][i+1]/velocity))
+@constraint(VRP, No_of_Vehicles,
+        (sum(x[i] for i in N_arcs) ≤ data[:num_vehicles]))  #vehicle on each route is less than or equal to number of vehicles in fleet
 @constraint(VRP, MaxCapacity,
-        (sum(ppload[i] for i in nodes) ≤ data[:vehicle_capacity])) #restrict number of people to maximum capacity of vehicle
-#@constraint(VRP, MaxTimePerNode,
-#        ((dur[i] ≤ data[:wait][1][i] for i in nodes)))
-        #doesn't seem to work yet  and I think it's better than the next constraint Maximum waiting time at each node
+        (sum(ppload[i] for i in nodes) ≤ data[:vehicle_capacity])) #restrict number of people to maximum capacity of vehicle#@constraint(VRP, MaxTimePerNode,
+@constraint(VRP, NodeCapacity[i in nodes],
+        (sum(ppload[i] for i in nodes) ≤ data[:vehicle_capacity]))
+@constraint(VRP, Waittime[i in 1:N_arcs],
+        (wait_dur[i] ≤ data[:wait][1][i])) #wait time at each node is lower than the assigned wait time per node
 @constraint(VRP, MaxTime,
-        (sum(dur[i] for i in nodes) ≤ sum(data[:wait][1][i] for i in nodes))) #Total time of traversing all nodes
+        (sum(dur[i] for i in N_arcs) ≤ sum(data[:wait][1][i] for i in nodes))) #Total time of traversing all nodes
 
+#Same issue here with quadratic equality constraint
+#I thought about setting all "x"s to 1?
 @constraint(VRP, ObjectiveFunction,
- (TotalCost == sum(ζ*x[i]*F_con[i] for i in nodes)))  #Total cost of running x_vehicles over all nodes
+ (TotalCost ≥ sum(ζ*x[i]*F_con[i] for i in 1:N_arcs)))  #Total cost of running x_vehicles over all nodes
 
 ##################################
 #           Objective            #
@@ -127,14 +141,3 @@ println("x: ", getvalue(x))
 println("Duration: ", getvalue(dur))
 println("Passengers: ", getvalue(ppload))
 println("TotalCost: ", getvalue(TotalCost))
-
-
-
-# function prold(a)
-#   b = 1
-#   for i in range(1,a)
-#     b = b*(i+1)
-#   end
-#   return b/(a+1)
-# end
-# prold(20)
